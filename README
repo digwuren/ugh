@@ -1,0 +1,6 @@
+Ugh implements attributable, or taggable, exceptions for Ruby
+together with implicit attribution via dynamically scoped and
+nestable domains.
+
+Please see <ugh.fab> for commented source and <test-ugh.rb> for
+examples.
