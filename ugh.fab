@@ -1,0 +1,287 @@
+This is the [[ugh]] Rubygem.  It provides facilities for
+attaching attributes to Ruby exceptions (to be exact, those
+exceptions that inherit from [[StandardError]]) at creation time
+and via dynamic scoping.  It also defines
+[[SystemCallError#strerror]] to produce a description of a
+low-level I/O operation in a manner suitable for embedding into
+a traditional Unix command line interface style error message.
+
+
+* BEWARE!
+
+In order to achieve these goals, [[ugh.rb]] defines or redefines
+certain methods in builtin Ruby classes.  Under certain
+hypothetical conditions, this may theoretically lead to
+conflicts with other libraries also meddling in these areas,
+perhaps for overlapping purposes, perhaps for incompatible
+purposes.  It is unlikely but possible.
+
+
+== Attributes for [[StandardError]]
+
+We'll start by augmenting [[StandardError]].
+
+<< .file lib/ugh.rb >>:
+  class StandardError
+    << @ [[StandardError]] >>
+  end
+
+
+Its constructor shall accept an optional and arbitrary set of
+attributes.  It shall store the message argument passed to it
+(if any) in [[@short_message]] (as contrary to the 'long
+message' returned by [[#message]] that will also represent the
+attributes) and these attributes in [[@attributes]] as a
+[[Hash]] keyed by [[Symbol]]:s.  (Note that Ruby's runtime
+engine does not directly reveal the message passed to
+[[Exception#initialize]]; instead, one has to call either
+[[#to_s]], [[#inspect]], or [[#message]].)
+
+We'll implement this by defining [[StandardError#initialize]].
+Unfortunately, it's unreasonably tricky to 'properly' get the
+replaced constructor to chain to the original [[StandardError]]
+constructor.  Fortunately, it turns out that [[StandardError]]
+does not /have/ a built-in constructor; it just inherits one
+from [[Exception]].  (See [[error.cc]]'s [[rb_eStandardError]].)
+Thus, our new method can just call the inherited constructor via
+[[super]], and as long as no other piece of code attempts to
+hijack [[StandardError]]'s constructor in the same Ruby engine,
+things should work out fine.
+
+<< @ [[StandardError]] >>:
+
+  def initialize short_message = 'unspecified ugh', **attributes
+    super short_message
+    @short_message = short_message
+    @attributes = attributes
+    return
+  end
+
+
+Both [[@short_message]] and [[@attributes]] shall be revealed to
+the user as appropriate methods, in read/write mode.  We do this
+by [[attr_accessor]].
+
+  attr_accessor :short_message
+  attr_accessor :attributes
+
+
+[[StandardError#to_s]] shall provide a reasonable representation
+of both the short message and the attributes.
+
+We'll generate a single-line string.  (Multiple lines is
+tempting if there are many attributes, but it would violate
+several implicit assumptions about [[Object#to_s]].)  At the
+beginning of the string will be the short message.  If there are
+any attributes, we'll append these to the string, by default
+wrapped in parentheses.  The attributes will be separated from
+each other by commas, and each name-value pair will be joined
+together with a colon.  We'll use [[#inspect]] to convert the
+attributes' values into string form but embed the attributes'
+names as they are.  We'll permit the caller to turn off the
+parentheses via a named parameter, which we'll call
+[[attributes_in_parentheses]].  When it's turned off, the short
+message will be separated from the first attribute by a
+comma instead of an opening paren.
+
+  def to_s attributes_in_parentheses: true
+    s = '' << @short_message
+    firstp = true
+    @attributes.each_pair do |name, value|
+      if firstp then
+        s << (attributes_in_parentheses ? ' (' : ', ')
+        firstp = false
+      else
+        s << ', '
+      end
+      firstp = false
+      s << name.to_s << ': ' << value.inspect
+    end
+    s << ')' if attributes_in_parentheses and !firstp
+    return s
+  end
+
+
+[[StandardError#inspect]] shall provide a reasonable
+representation of both the short message and the attributes; one
+that won't be easily confused with external representation of an
+object.
+
+We'll implement this by calling [[#to_s]] and wrapping its
+result into [[#<...>]].  Because this wrapper already provides a
+suitable enclosure, we'll turn [[#to_s]]'s
+[[attributes_in_parentheses]] feature off in [[#inspect]].
+
+  def inspect
+    return '#<' + to_s(attributes_in_parentheses: false) + '>'
+  end
+
+
+There's no need to define [[StandardError#message]].  The way
+the runtime defines [[Exception#message]], it just calls
+[[#to_s]], which does the right thing.
+
+
+We'll also provide syntactic sugar, in the form of [[#[]]] and
+[[#[]=]], for accessing and replacing the attributes.  If the
+user needs more complex operations, the method [[attributes]]
+should be used explicitly.  In these methods, which for the main
+part are just delegation wrappers, we'll convert the [[name]]
+argument into a [[Symbol]] by calling its [[#to_sym]].  This
+way, the user can pass either strings rather than symbols as
+names, and the right thing will still happen.
+
+  def [] name
+    return @attributes[name.to_sym]
+  end
+
+
+  def []= name, value
+    return @attributes[name.to_sym] = value
+  end
+
+
+== Raising attributeful exceptions
+
+Next, we'll provide an attribute-friendly way to raise run-time
+errors.  A tempting approach would be to replace the builtin
+[[raise]]; unfortunately, given its nontrivial signature _and_
+the relation to [[Thread#raise]], the KISS principle would
+strongly suggest another way.  Thus, we'll define a method with
+a simple, easy to pronounce and intuitively obvious name.
+
+<< .file lib/ugh.rb >>:
+
+  def ugh short_message = 'unspecified ugh', **attr
+    if short_message.is_a? Class then
+      # Uh-oh, it's not a short message at all but an exception
+      # class (or so we should hope).  Let's instantiate it.
+      raise short_message.new(**attr)
+    else
+      raise Ugh.new(short_message, **attr)
+    end
+  end
+
+
+The exception class [[ugh]] uses inherits from [[RuntimeError]].
+However, note that since we attached the attribute mechanism to
+its parent class, [[StandardError]], it is quite possible, if it
+would be more appropriate, to define new exception classes that
+do not inherit from [[RuntimeError]] and still benefit from the
+attribution facility.  The user will just have to manually
+construct an instance and [[raise]] it.
+
+
+  class Ugh < RuntimeError
+  end
+
+
+== Defining exception attributes via dynamic scope
+
+Next, we'll define a method that will take arbitrary attributes
+and a block, and attach these attributes to any exception that
+might get raised from this block.  We'll call it [[ugh?]].  The
+name violates conventions somewhat, in that the trailing ques
+does not indicate it's a predicate, rather it implies an
+interrogation in the form of "So, ugh happened?  Well, about
+this: ...".
+
+There are a few nuances about attributing and re-attributing
+exceptions.  For one, we'll want to give precedence to the
+attributes that the exception already has -- since they were set
+up closer to the exception happening, perhaps as it was raised,
+perhaps in an inner [[ugh?]] block, they're presumedly more
+specific and more useful than what we would have at the current
+[[ugh?]] block.
+
+For another, it sometimes happens that a block knows that it
+wants to attach an attribute to exceptions raised from it, but
+doesn't know the attribute's value at the start of the block.
+Such a conundrum might be solved by nesting several [[ugh?]]
+blocks, in accordance with the information becoming available,
+and this is often the recommended approach.  However, there are
+some patterns -- such as the standard line-by-line parser -- in
+which case it might be more appropriate to define an attribute
+in an [[ugh?]] block not by a constant value but by an
+expression, to be evaluated when the exception gets actually
+thrown.  In order to support this pattern, we'll check, when
+handling an exception, whether any of the attributes passed to
+[[ugh?]] have a value that is an instance of [[Proc]], and if
+so, execute it and use the returned value rather than the
+[[Proc]] itself as the attribute to be attached to the
+exception.
+
+Note that this means that it won't be possible to attach
+[[Proc]] instances to an exception as attributes deliberately
+via [[ugh?]] blocks.  It's a bit of a wart, but considering that
+attributes of exceptions are primarily meant for a user's eyes,
+to help with diagnosing the issue, and automated handling of
+formal attributes should in general not do anything more than
+present the attributes to the user in a suitable form, the cost
+is probably acceptable.  In the rare cases when this won't hold,
+the user can easily resort to a [[begin]] ... [[rescue]] ...
+[[end]] block instead of [[ugh?]].
+
+For third, not all attributions apply to all exceptions alike.
+To that end, while [[ugh?]] by default handles instances of
+[[Ugh]], it shall accept an optional exception class to narrow
+(or possibly widen) the set of attributes subject to relabelling
+by this [[ugh?]] block.
+
+<< .file lib/ugh.rb >>:
+  def ugh? klass = Ugh, **attributes
+    begin
+      return yield
+    rescue klass => exception
+      evaluated_attributes = {}
+      attributes.each_pair do |name, value|
+        << ? Evaluate [[value]] of this attribute >>
+        evaluated_attributes[name] = value
+      end
+      exception.attributes =
+          evaluated_attributes.merge exception.attributes
+      raise exception
+    end
+  end
+
+
+We won't execute [[value.call]] even if [[value]] is a [[Proc]]
+if we would be immediately discarding its result afterwards for
+the reason that such an attribute has already been attached to
+the exception.  However, we don't want to let this affect the
+order of keys in this [[Hash]] -- recall that modern Ruby
+versions retain a hash's key order --, so in such a case we'll
+use [[nil]] as the placeholder.
+
+<< ? Evaluate [[value]] of this attribute >>:
+  if value.is_a? Proc then
+    unless exception.attributes.has_key? name then
+      value = value.call
+    else
+      value = nil
+    end
+  end
+
+
+== [[strerror]]-like error messages for system calls
+
+Finally, on a perihperally related topic, we'll define
+[[SystemCallError#strerror]] to return an error message somewhat
+more conforming to Unix's command line interface error reporting
+customs than what Ruby provides by default.
+
+<< .file lib/ugh.rb >>:
+  class SystemCallError
+    def strerror
+      # Remove in-sentence bits of context such as filename(s)
+      # by looking up the error message without context:
+      m = SystemCallError.new(errno).message
+
+      # Fix message case by downcasing the initial uppercase
+      # letter except if it's immediately followed by another
+      # uppercase letter, as in [["RPC version wrong"]]:
+      m = m.sub(/\A[[:upper:]](?![[:upper:]])/){$&.downcase}
+
+      return m
+    end
+  end

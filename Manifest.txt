@@ -1,0 +1,7 @@
+GPL-3
+Manifest.txt
+build.sh
+lib/ugh.rb
+test-ugh.rb
+ugh.fab
+ugh.gemspec
